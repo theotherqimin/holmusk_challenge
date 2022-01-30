@@ -1,0 +1,686 @@
+---
+title: "Holmusk Healthcare Dataset Challenge"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r, message = FALSE}
+packages.vec <- c("tidyverse", "GGally", "gridExtra", "mice")
+for (i in packages.vec) {
+  require(i, character.only = TRUE)
+}
+```
+
+```{r}
+bill_amount <- read.csv("bill_amount.csv")
+bill_id <- read.csv("bill_id.csv")
+clinical_data <- read.csv("clinical_data.csv")
+demographics <- read.csv("demographics.csv")
+```
+
+# Data Preparation 
+
+### Preparing billing information 
+
+Given 'bill_amount.csv' and 'bill_id.csv', it was noted that each patient had multiple bills associated with each visit. Since there is no additional information about any differences in bills, it is reasonable to collapse multiple bills into one variable 'total_bill' for each patient per visit. </br>
+
+```{r}
+billing_information <- merge(x = bill_id, y = bill_amount, all = TRUE) #nrow = 13600
+sum(duplicated(billing_information$patient_id)) #confirm repeat IDs
+
+billing_information <- billing_information %>% group_by(patient_id, date_of_admission) %>% 
+  mutate(total_bill = sum(amount)) %>% 
+  distinct(subset(., select = c("patient_id", "date_of_admission", "total_bill"))) 
+
+summary(billing_information)
+head(billing_information)
+```
+
+</br>
+
+### Preparing demographic information  
+
+```{r}
+str(demographics)
+summary(demographics)
+```
+</br>
+Preliminary overview of 'demographics.csv' indicates that there are differences in coding of the variables, despite referring to the same values. Each demographic variable is therefore checked to ensure that the values are grouped appropriately.  
+</br>
+
+```{r}
+unique(demographics$resident_status) #check how resident_status is grouped
+demographics[demographics$resident_status == "Singapore citizen", 
+             "resident_status"] <- "Singaporean"
+
+unique(demographics$gender) #check how gender is grouped
+demographics$gender <- ifelse(demographics$gender == "Female"|demographics$gender == "f",
+                              "Female", "Male")
+
+unique(demographics$race) #check how race is grouped
+demographics[demographics$race == "chinese", 
+             "race"] <- "Chinese"
+demographics[demographics$race == "India", 
+             "race"] <- "Indian"
+
+demographics[c("race","resident_status","gender")] <- lapply(demographics[c("race","resident_status","gender")], 
+                                       as.factor)
+```
+  
+</br>
+Given the date of birth, it is unlikely that the day and month will have a significant impact on cost of care. Thus, they are removed. The birth year is kept to calculate the individual's age at admission later on. 
+
+Age at admission could be relevant as within the healthcare setting, the age of a patient is potentially an indicator of the patient's risk for illnesses as well as type of treatment offered, given a particular illness. Both of which will have an impact on cost of care.
+</br>
+
+```{r}
+demographics <- demographics %>% separate("date_of_birth", c("birth_year","birth_month","birth_day"), sep = "-")
+demographics$birth_year <- as.numeric(demographics$birth_year)
+demographics <- demographics[ , !names(demographics) %in% c("birth_month","birth_day")]
+
+str(demographics)
+summary(demographics)
+```
+</br>
+
+### Preparing clinical data  
+
+```{r}
+str(clinical_data)
+summary(clinical_data)
+
+colnames(clinical_data)[ apply(clinical_data, 2, anyNA) ] #columns with missing data
+
+clinical_data$medical_history_3 <- ifelse(clinical_data$medical_history_3 == "Yes"|clinical_data$medical_history_3 == "1",
+                                          1, 0)
+colnames(clinical_data)[1] <- "patient_id"
+```
+  
+</br>
+Given date of admission and date of discharge, 'length_of_stay' was calculated. Since hospitals charge by number of nights stayed as an inpatient, length of stay is likely to be associated with cost of care. 
+
+```{r}
+clinical_data <- clinical_data %>% 
+  mutate(length_of_stay = as.numeric(difftime(date_of_discharge,date_of_admission, units = "days")), .after = date_of_discharge)
+  
+```
+  
+</br>
+From 'bill_amount.csv', it was indicated that some patients had repeat admissions. Repeat admissions could suggest chronic or more complex medical conditions. These patients could represent a distinct population.
+
+```{r}
+repeat_visit_patients <- clinical_data$patient_id[duplicated(clinical_data$patient_id)] #ids of repeat visit
+repeat_visit.dat <- plyr::ddply(subset(clinical_data, patient_id %in% repeat_visit_patients), "patient_id", nrow)
+nrow(repeat_visit.dat) #379 repeat patients 
+colnames(repeat_visit.dat)[2] <- "total_visit"
+
+full_data <- merge(clinical_data, repeat_visit.dat, by = "patient_id", all = TRUE) 
+full_data$total_visit[is.na(full_data$total_visit)] <- 1
+full_data$total_visit <- as.factor(full_data$total_visit)
+```
+
+</br>
+
+### Obtaining compiled dataset
+</br>
+
+After joining all datasets into one, additional variables were derived from the given data — 'age_at_admission', 'BMI', and 'BMI.cat' (BMI category as classified by the Ministry of Health in Singapore). Age at admission was created as an arguably more relevant driver than the patient's current age, as this reflects more accurately information pertaining to each admission. </br>
+
+BMI was calculated, and will be used in place of height/weight (for insights; to be reconsidered if modelling), because it is commonly used as indicator of risk for health complications. Although there is some controversy surrounding the reliability of BMI, given that it fails to consider composition of weight, the sample is sufficiently large to still justify its consideration as a risk factor.  
+
+
+```{r}
+full_data <- merge(demographics, full_data, by = "patient_id", all = TRUE)
+full_data <- merge(full_data, billing_information, by = c("patient_id", "date_of_admission"), all = TRUE)
+
+
+full_data <- full_data %>% separate("date_of_admission", 
+                                        c("admission_year","admission_month","admission_day"), 
+                                        sep = "-", remove = FALSE)
+full_data$admission_year <- as.numeric(full_data$admission_year)
+full_data <- select(full_data, -c("admission_month","admission_day")) %>%
+  mutate(age_at_admission = admission_year - birth_year, .after = date_of_admission) %>% 
+  mutate(BMI = weight/((height/100)^2), .after = height)  %>% 
+  mutate(BMI.cat = ifelse(BMI < 18.5, "low", ifelse(BMI > 22.9, "high", "mid")), .after = BMI)
+full_data$BMI.cat <- factor(full_data$BMI.cat,
+                            levels = c("low", "mid","high"),
+                            labels = c("L", "M", "H"))
+```
+  
+</br>
+3 additional composite scores were also created — 'total_medicalhistory', 'total_preopmed', 'total_symptom' to reflect the total scores from 7 items of medical history, 6 items of pre-operation medication administered, and 5 items of symptoms present at admission (assumed). </br>
+
+While no explicit information was provided, it is interesting to note that the medical history items are unlikely to all be lifetime medical history (e.g. do you have asthma?), since repeat admission patients did not present with the same scores for the 7 items in each admission. </br>
+
+Composite scores were created for further comparison across patients. It is reasonable to expect that a higher composite score is reflective of more complex healthcare demands (i.e. the need for more medication prescribed, more symptoms present etc.) </br>
+
+```{r}
+full_data <- full_data %>% 
+  mutate(total_medicalhistory = medical_history_1 +
+           medical_history_2 +
+           medical_history_3 +
+           medical_history_4 +
+           medical_history_5 +
+           medical_history_6 +
+           medical_history_7,
+         .after = symptom_5) %>% 
+  mutate(total_preopmed = preop_medication_1 +
+           preop_medication_2 +
+           preop_medication_3 +
+           preop_medication_4 +
+           preop_medication_5 +
+           preop_medication_6,
+         .after = symptom_5) %>% 
+  mutate(total_symptom = symptom_1 +
+           symptom_2 + 
+           symptom_3 +
+           symptom_4 +
+           symptom_5,
+         .after = symptom_5)
+```
+
+
+```{r}
+exploration_data <- full_data 
+exploration_data_l <- full_data #just for creating long format to explore
+
+exploration_data_l[c("race","resident_status","gender","total_visit", "BMI.cat")] <-  lapply(exploration_data_l[c("race","resident_status","gender","total_visit", "BMI.cat")], 
+as.numeric)
+```
+</br>
+
+# Data Exploration
+
+### Preparing full dataset for exploration  
+
+```{r}
+variables_to_exclude <- c("patient_id", "date_of_admission", "date_of_discharge")
+continuous_variables <- c("admission_year", "age_at_admission", "birth_year", "length_of_stay", "lab_result_1",
+                          "lab_result_2", "lab_result_3", "height", "weight", "BMI", "total_bill", 
+                          "total_symptom", "total_preopmed", "total_medicalhistory")
+discrete_variables <- names(exploration_data)[ !names(exploration_data) %in% c(variables_to_exclude, continuous_variables)]
+medical_history_var <- c("medical_history_1", "medical_history_2", "medical_history_3",
+                         "medical_history_4", "medical_history_5", "medical_history_6",
+                         "medical_history_7")
+preop_medication_var <- c("preop_medication_1","preop_medication_2", "preop_medication_3",
+                          "preop_medication_4", "preop_medication_5","preop_medication_6")
+symptom_var <- c("symptom_1", "symptom_2", "symptom_3", "symptom_4", "symptom_5")
+demographic_var <- discrete_variables[!discrete_variables %in% c(medical_history_var, preop_medication_var, symptom_var)]
+
+exploration_data.long <- reshape2::melt(exploration_data_l,
+                                 id.vars = variables_to_exclude,
+                                 variable.name = "Measures",
+                                 value.name = "Values")
+```
+</br>
+
+### Visualising Data
+
+#### General overview
+
+```{r, fig.width=9, fig.height=9, fig.cap="Fig 1. Histogram for each discrete variable", warning=FALSE}
+ggplot(subset(exploration_data.long, Measures %in% discrete_variables), aes(x = Values))+
+  geom_histogram(stat="count")+
+  facet_wrap(~Measures, scales = "free", ncol = 5) +
+  scale_x_continuous(breaks = seq(0, 4, by = 1)) +
+  theme_bw()
+
+```
+  
+</br>
+To note from histograms of discrete variables (Fig 1.): 
+
+* sample comprises mostly of Chinese individuals, followed by Indian, Malay, and other ethnicities 
+* sample is also mostly reflective of Singaporeans, with significantly fewer Foreigners and PRs. 
+* gender of patients are roughly equal 
+* majority of patients are in the 'unhealthy' range of BMI (patients over-represented in this sample) 
+</br>
+
+  
+```{r fig.width=11, fig.height=11, fig.cap="Fig 2. Spread of continuous variables", warning=FALSE}
+ggplot(subset(exploration_data.long, Measures %in% continuous_variables), aes(x = Measures, y = Values))+
+  geom_point()+
+  facet_wrap(~Measures, scales = "free", ncol = 1) +
+  coord_flip() + theme_bw()
+```
+</br>  
+To note from spread of continuous variables (Fig 2.):
+
+* BMI scores are largely clustered around the 'unhealthy' range, though there are several that exceed the mid-30s range, and would be considered higher risk for obesity-related diseases (according to Singapore MOH)  
+</br>
+
+```{r, fig.width=25, fig.height=25, fig.cap="Fig 3. Correlations of all continuous variables, by gender"}
+plotgg <- ggpairs(subset(exploration_data, select = c(continuous_variables[!continuous_variables %in% c("height", "weight", "birth_year")], "gender")), progress = FALSE,
+                          ggplot2::aes(colour= factor(gender),
+                                       alpha = 0.2))
+
+suppressWarnings(   print(plotgg)   ) 
+```
+</br>  
+To note from Correlations of all continuous variables, by gender (Fig 3.):
+
+* relationship between BMI and total bill
+* relationship between total symptoms and total bill
+* relationship between total medical history and total bill 
+* relationship between total preop medication and total bill 
+* relationship between age at admission and total bill
+* distribution of age at admission
+* although length of stay is statistically different for gender, the effect is very small  
+
+</br>
+```{r, fig.width=13, fig.height=13, fig.cap="Fig 4. Correlations of all continuous variables, by BMI.cat"}
+plotgg2 <- GGally::ggpairs(subset(exploration_data, select = c(continuous_variables[!continuous_variables %in% c("height", "weight", "birth_year")], "BMI.cat")), progress = FALSE,
+                          ggplot2::aes(colour= factor(BMI.cat)
+                                       , alpha = 0.2))
+
+suppressWarnings(   print(plotgg2)   ) 
+```
+</br>  
+To note from Correlations of all continuous variables, by BMI.cat (Fig 4.):
+
+* BMI categories clearly represent different populations within the continuous variables 
+* relationship between BMI categories and total bill (expected based on BMI raw scores)
+* relationship between total bill and BMI possibly accounted for by total symptoms/medical history/preop med (BMI as a covariate)
+</br>
+
+```{r, fig.width=14, fig.height=8, fig.cap="Fig 5. Density plot and boxplot of total bill"}
+total_bill.box <- ggplot(exploration_data, aes(x=total_bill)) +
+  geom_boxplot() + theme_bw()
+total_bill.density <- ggplot(exploration_data, aes(x=total_bill)) +
+  geom_density() + theme_bw()
+grid.arrange(total_bill.density, total_bill.box, nrow = 1)
+total_bill_max <- as.numeric(quantile(exploration_data$total_bill)['75%'] + IQR(exploration_data$total_bill))
+print(total_bill_max)
+mean(exploration_data$total_bill)
+```
+  
+</br>
+To note from density plot and boxplot of total bill (Fig. 5): 
+
+* total bill is positively skewed 
+* 'max' of total bill is 38567.21 (will round up to ~40000 and use this as limit for total_bill as y-axis for clearer illustration)
+* mean of total bill is $21859.07
+* outliers not removed from analysis 
+
+</br>  
+
+
+#### Medical information variables
+
+```{r, fig.width=9, fig.height=7, fig.cap="Fig 6. Density plots of total bill based on medical history, preoperation medication and symptoms", warning=FALSE}
+exploration_data %>% subset(., select = names(exploration_data) %in%
+                              c(medical_history_var, preop_medication_var,
+                                symptom_var, "total_bill", "patient_id")) %>%
+  drop_na() %>% 
+  reshape2::melt(., 
+                 id.vars = c("patient_id", "total_bill"),
+                 variable.name = "Measure",
+                 value.name = "Values") %>% 
+  ggplot(., aes(x = total_bill, fill = factor(Values))) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~Measure) +
+  labs(fill = "Presence") +
+  xlim(0,40000) + theme(axis.text.x=element_text(angle=45, hjust=1)) +
+  theme_bw()
+```
+</br>
+To note from density plots of total bill based on medical history, preop medication and symptoms (Fig. 6): 
+
+Differences in total bill likely to be seen in (presence accounts for higher total bill):
+
+* medical history 1 and 6
+* symptoms 1, 2, 3, 4, and 5 (5 being the greatest)
+
+Should take a closer look at these variables to explore relationship with total bill. </br>
+
+```{r, fig.cap="Fig 7. Boxplot of total bill as a function of medical history", warning=FALSE}
+exploration_data %>%  subset(., select = c(medical_history_var, "total_bill")) %>% 
+  drop_na() %>% 
+  reshape2::melt(., id.vars = "total_bill",
+                 variable.name = "medical_history",
+                 value.name = "scores") %>% 
+  ggplot(., aes(x = medical_history, y = total_bill, fill = factor(scores)))+
+  geom_boxplot() +
+  ylim(0,40000)+
+  labs(fill = "Score") + theme_bw() +
+  theme(axis.text.x=element_text(angle=45, hjust=1))
+```
+```{r}
+medical_history_list <- NULL
+for (i in 1:length(medical_history_var)) {
+  formula.str <- paste("total_bill~", medical_history_var[i], sep="")
+  formula.model <- as.formula(formula.str)
+  medical_history_list[[i]] <- lm(formula.model, exploration_data)
+  print(summary(medical_history_list[[i]]))
+}
+```
+</br>
+To note from analysis of medical history and total bill (Fig. 7): 
+
+* coefficient of medical_history_1 is `r medical_history_list[[1]]$coefficients[2]`
+* coefficient of medical_history_5 is `r medical_history_list[[5]]$coefficients[2]`
+* coefficient of medical_history_6 is `r medical_history_list[[6]]$coefficients[2]`
+* coefficient of medical_history_7 is `r medical_history_list[[7]]$coefficients[2]`
+
+</br>
+
+```{r, fig.cap="Fig 8. Boxplot of total bill as a function of pre-operation medication", warning=FALSE}
+exploration_data %>%  subset(., select = c(preop_medication_var, "total_bill")) %>% 
+  drop_na() %>% 
+  reshape2::melt(., id.vars = "total_bill",
+                 variable.name = "preop_medication",
+                 value.name = "scores") %>% 
+  ggplot(., aes(x = preop_medication, y = total_bill, fill = factor(scores)))+
+  geom_boxplot() + ylim(0,40000) +  
+  labs(fill = "Score") + theme_bw() +
+  theme(axis.text.x=element_text(angle=45, hjust=1))
+```
+
+```{r}
+preopmed_list <- NULL
+for (i in 1:length(preop_medication_var)) {
+  formula.str <- paste("total_bill~", preop_medication_var[i], sep="")
+  formula.model <- as.formula(formula.str)
+  preopmed_list[[i]] <- lm(formula.model, exploration_data)
+  print(summary(preopmed_list[[i]]))
+}
+```
+</br>
+To note from analysis of pre-operation medication and total bill (Fig. 8):  
+
+None reached statistical significance 
+</br>
+
+
+```{r, fig.cap="Fig 9. Boxplot of total bill as a function of symptoms", warning=FALSE}
+exploration_data %>%  subset(., select = c(symptom_var, "total_bill")) %>% 
+  drop_na() %>% 
+  reshape2::melt(., id.vars = "total_bill",
+                 variable.name = "symptom",
+                 value.name = "scores") %>% 
+  ggplot(., aes(x = symptom, y = total_bill, fill = factor(scores)))+
+  geom_boxplot() +
+  ylim(0, 40000) +
+  labs(fill = "Score") + theme_bw()
+```
+```{r}
+symptom_list <- NULL
+for (i in 1:length(symptom_var)) {
+  formula.str <- paste("total_bill~", symptom_var[i], sep="")
+  formula.model <- as.formula(formula.str)
+  symptom_list[[i]] <- lm(formula.model, exploration_data)
+  print(summary(symptom_list[[i]]))
+}
+```
+</br>
+To note from analysis of symptom and total bill (Fig. 9): 
+
+* coefficient of symptom_1 is `r symptom_list[[1]]$coefficients[2]`
+* coefficient of symptom_2 is `r symptom_list[[2]]$coefficients[2]`
+* coefficient of symptom_3 is `r symptom_list[[3]]$coefficients[2]`
+* coefficient of symptom_4 is `r symptom_list[[4]]$coefficients[2]`
+* coefficient of symptom_5 is `r symptom_list[[5]]$coefficients[2]`
+</br> </br>
+
+Given the information from individual medical history/pre-op medication/symptom scores, now consider composite scores for a more comprehensive understanding. </br> 
+```{r, fig.cap="Fig 10. Relationship between total medical history score and total bill", warning=FALSE}
+
+ggplot(exploration_data, aes(x = total_medicalhistory, y = total_bill)) +
+  geom_point(size = 0.8, alpha = 0.5) + 
+  geom_smooth(method='lm') + 
+  ylim(0, 40000) +
+  theme_bw()
+```
+
+```{r}
+lm.model.medhist <- lm(total_bill~total_medicalhistory, data = exploration_data)
+summary(lm.model.medhist)
+```
+</br>
+To note from analysis of total medical history score and total bill (Fig. 10):
+
+* coefficient of total medical history score is `r lm.model.medhist$coefficients[2]`
+</br>
+
+```{r, fig.cap="Fig 11. Relationship between total medical history score and total bill", warning=FALSE}
+ggplot(exploration_data, aes(x = total_preopmed, y = total_bill)) +
+  geom_point(size = 0.8, alpha = 0.3) + 
+  geom_smooth(method='lm') + 
+  ylim(0, 40000) + theme_bw()
+```
+
+```{r}
+lm.model.preopmed <- lm(total_bill~total_preopmed, data = exploration_data)
+summary(lm.model.preopmed)
+```
+</br>
+To note from analysis of total pre-operation medication score and total bill (Fig. 11):
+
+* coefficient of total pre-operation medication score is `r lm.model.preopmed$coefficients[2]`
+</br>
+
+```{r, fig.cap="Fig 12. Relationship between total symptom score and total bill", warning=FALSE}
+
+ggplot(exploration_data, aes(x = total_symptom, y = total_bill)) +
+  geom_point(size = 0.8, alpha = 0.3) + 
+  geom_smooth(method='lm') + 
+  ylim(0, 40000) + theme_bw()
+
+```
+
+```{r}
+lm.model.symptom <- lm(total_bill~total_symptom, data = exploration_data)
+summary(lm.model.symptom)
+```
+</br>
+To note from analysis of total symptom score and total bill (Fig. 12):
+
+* coefficient of total symptom score is `r lm.model.symptom$coefficients[2]`
+</br></br>
+
+
+```{r}
+summary(lm(total_bill~lab_result_1, exploration_data))
+summary(lm(total_bill~lab_result_2, exploration_data))
+summary(lm(total_bill~lab_result_3, exploration_data))
+
+```
+
+</br>
+To note from analysis of lab results and total bill (Fig. 11):
+
+* lab results scores do not appear to be associated with total bill
+* can consider if lab results score are associated with other variables (e.g. if a certain score means having to take certain kinds of medication)
+</br>  
+
+
+#### Demographic variables
+
+```{r, fig.cap= "Fig 13. Distribution of patients' age at admission"}
+ggplot(exploration_data, aes(x=age_at_admission)) +
+  geom_density() + theme_bw()
+```
+</br>
+To note from distribution of patients' age at admission (Fig. 13):
+
+* Bimodal distribution of age at admission suggests that rates of hospitalisation increases at just before 40s and around late 50s
+</br>
+
+
+```{r, fig.cap= "Fig 14. Relationship between age at admission and total bill", warning=FALSE}
+ggplot(exploration_data, aes(x = age_at_admission, y = total_bill)) +
+  geom_point(size = 0.8, alpha = 0.3) + 
+  geom_smooth(method='lm') + 
+  ylim(0, 40000) + 
+  theme_bw()
+```
+
+```{r}
+lm.model.age <- lm(total_bill~age_at_admission, data = exploration_data)
+summary(lm.model.age)
+```
+</br>
+To note from analysis of age at admission and total bill (Fig. 14):
+
+* coefficient of age at admission is `r lm.model.age$coefficients[2]`
+</br>
+
+
+```{r, fig.cap="Fig 15. Boxplot of total bill as a function of patients' resident status"}
+ggplot(exploration_data, aes(x=resident_status, y=total_bill, fill = resident_status)) +
+  geom_boxplot() + 
+  stat_summary(fun=mean, geom="point", size=2, color="white")+
+  theme_bw()
+```
+
+```{r, fig.cap="Fig 16. Distribution of patients' resident status"}
+ggplot(exploration_data, aes(x = resident_status, fill = resident_status)) +
+  geom_bar() + theme_bw()
+```
+
+```{r}
+anova.resident <- aov(total_bill ~ resident_status, data = exploration_data)
+TukeyHSD(anova.resident)
+```
+</br>
+To note from analysis of resident status and total bill (Fig. 15 and 16):
+
+* bulk of patients are Singaporean
+* even though few patients are foreigners, mean total bill for foreigners is significantly higher than PRs and Singaporeans 
+* suggests foreigners' bills higher (assuming bill is pre-deduction from insurance etc., plausible that sample is a result of foreigners with more complex conditions demanding certain expertise and the means to pay for it)
+* given that PR fees are also higher than Singaporeans, possible that bill already takes resident status into account 
+* compared to foreigners, who pay `r anova.resident$coefficients[1]` on average, PRs pay `r abs(anova.resident$coefficients[2])` less, and Singaporeans pay `r abs(anova.resident$coefficients[3])` less
+* Singaporeans pay `r abs(TukeyHSD(anova.resident)$resident_status[3])` less than PRs
+</br>  
+
+
+
+```{r, fig.cap="Fig 17. Boxplot of total bill as a function of gender", warning = FALSE}
+ggplot(exploration_data, aes(x = gender, y = total_bill, col = gender)) +
+  geom_boxplot()+
+  stat_summary(fun=mean, geom="point", size=2, color="black")+
+  ylim(10000,30000)+
+  theme_bw()
+```
+```{r}
+lm.model.gender <- lm(total_bill~gender, data = exploration_data)
+summary(lm.model.gender)
+```
+</br>
+To note from analysis of gender and total bill (Fig. 17):
+
+* on average, males pay `r lm.model.gender$coefficient[2]` more than females
+</br>
+
+```{r, fig.cap="Fig 17. Boxplot of total bill as a function of race", warning = FALSE}
+ggplot(exploration_data, aes(x=race, y=total_bill, fill = race)) +
+  geom_boxplot() + 
+  stat_summary(fun=mean, geom="point", size=2, color="black")+
+  theme_bw()+
+  ylim(0,40000)
+```
+
+```{r}
+anova.race <- aov(total_bill ~ race, data = exploration_data)
+TukeyHSD(anova.race)
+```
+
+```{r, fig.cap="Fig 19. Distribution of patients' race"}
+ggplot(exploration_data, aes(x = race, fill = race)) +
+  geom_bar() + theme_bw()
+```
+
+</br>
+To note from analysis of race and total bill (Fig. 18 and 19):
+
+* bulk of patients are Chinese
+* average bill is highest for Malays, followed by Indians, Others, and Chinese
+* compared to Chinese, who pay `r anova.race$coefficients[1]` on average, Others pay `r abs(anova.race$coefficients[4])` more, Indians pay `r abs(anova.race$coefficients[2])` more and Malays pay `r abs(anova.race$coefficients[3])` more
+
+</br>
+
+
+#### Additional variables 
+
+```{r, fig.cap="Fig 20. Relationship between length of stay and total bill", warning=FALSE}
+ggplot(exploration_data, aes(x = length_of_stay, y = total_bill)) +
+  geom_point() +
+  geom_smooth(method = 'lm')+
+  ylim(0,40000) + theme_bw()
+summary(lm(total_bill~length_of_stay, exploration_data))
+```
+
+</br>
+To note from analysis of length of stay and total bill (Fig. 20):
+
+* longest stay was 20 days
+* length of stay was not associated with total bill 
+</br>
+
+
+```{r, fig.cap="Fig 21. Distribution of total bill based on BMI category", warning=FALSE}
+ggplot(exploration_data, aes(x = total_bill, fill = factor(BMI.cat))) +
+  geom_density(alpha = 0.3) + theme_bw() + labs(fill = "BMI Category")
+```
+
+```{r, fig.cap="Fig 22. Relationship between BMI score and total bill", warning=FALSE}
+ggplot(exploration_data, aes(x=BMI, y = total_bill)) +
+  geom_point(alpha = 0.4, size = 0.8)+
+  geom_smooth(method='lm') + ylim(0, 40000) + theme_bw()
+```
+
+
+```{r}
+lm.model.BMI <- lm(total_bill ~ BMI, data = exploration_data)
+summary(lm.model.BMI)
+```
+</br>
+To note from analysis of BMI and total bill (Fig. 21 and 22):
+
+* coefficient of BMI is `r lm.model.BMI$coefficients[2]`
+</br>
+
+
+# For further consideration
+
+### Missingness 
+
+```{r}
+full_data %>% 
+  summarize_all(  function(x){sum(is.na(x)/length(x)) }     ) #proportion of missing data
+
+VIM::aggr(full_data, col=c('navyblue','red'), numbers= TRUE, sortVars=TRUE, labels=names(full_data), cex.axis=.5, gap=2, ylab=c("Histogram of missing data","Pattern"))
+
+set.seed(092356)
+mice_mod <- mice(full_data, 
+                 m = 20,
+                 method= 'rf',
+                 print = FALSE)
+
+densityplot(mice_mod)
+
+model_data <- complete(mice_mod, 1)
+str(model_data)
+
+```
+
+# Additional graphs for presentation
+
+```{r}
+exploration_data %>% 
+  group_by(race) %>% 
+  summarize(total_bill = mean(total_bill)) %>% 
+  ggplot(., aes(x = race, y = total_bill, color = race)) +
+  geom_point(size = 2) + theme_bw() + theme(legend.position="none")+
+  ylim(15000,30000)
+```
+
+```{r}
+exploration_data %>% 
+  group_by(resident_status) %>% 
+  summarize(total_bill = mean(total_bill)) %>% 
+  ggplot(., aes(x = resident_status, y = total_bill, color = resident_status)) +
+  geom_point(size = 2) + theme_bw() + theme(legend.position="none")+
+  ylim(15000,50000)
+```
